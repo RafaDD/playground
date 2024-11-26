@@ -28,8 +28,12 @@ __global__ void matmul_f32_v3(const float32_t* a, const float32_t* b, float32_t*
     const int ty = threadIdx.y;
     const int tid = ty * blockDim.x + tx;
 
-    __shared__ float s_a[BM][BK];
-    __shared__ float s_b[BK][BN];
+    // alignment to 16k, which is helpful, 5.42 -> 8.01 TFLOPS
+    __shared__ __align__(16 * 1024) float s_a[BM][BK];
+    __shared__ __align__(16 * 1024) float s_b[BK][BN];
+
+    // __shared__ float s_a[BM][BK];
+    // __shared__ float s_b[BK][BN];
 
     float r_c[TM][TN] = {{0.0}};
 
