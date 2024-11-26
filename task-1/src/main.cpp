@@ -78,6 +78,7 @@ auto main() -> int
             }
 
             cudaEventRecord(start, nullptr);
+            // ::printf("%g\n", A[0]);
             playground::matmul<playground::params::DataType,
                                playground::params::MatmulVersion>(
                 playground::params::M, playground::params::N,
