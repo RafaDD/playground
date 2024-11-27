@@ -28,7 +28,7 @@ __global__ void matmul_f32_v3(const float32_t* a, const float32_t* b, float32_t*
     const int ty = threadIdx.y;
     const int tid = ty * blockDim.x + tx;
 
-    // alignment to 16k, which is helpful, 5.42 -> 8.01 TFLOPS
+    // align to 16k, which is helpful, 5.42 -> 8.01 TFLOPS
     __shared__ __align__(16 * 1024) float s_a[BM][BK];
     __shared__ __align__(16 * 1024) float s_b[BK][BN];
 
@@ -37,6 +37,7 @@ __global__ void matmul_f32_v3(const float32_t* a, const float32_t* b, float32_t*
 
     float r_c[TM][TN] = {{0.0}};
 
+    // each thread needs to read 4 numbers, get the shared memory addr according to thread id
     int load_a_smem_m = tid >> 1;
     int load_a_smem_k = (tid & 1) << 2;
     int load_b_smem_k = tid >> 5;
@@ -49,6 +50,7 @@ __global__ void matmul_f32_v3(const float32_t* a, const float32_t* b, float32_t*
 
         int load_a_gmem_k = bk * BK + load_a_smem_k;
         int load_a_gmem_addr = OFFSET(load_a_gmem_m, load_a_gmem_k, K);
+        // read 4 float numbers with 1 command
         FLOAT4(s_a[load_a_smem_m][load_a_smem_k]) = FLOAT4_CONST(a[load_a_gmem_addr]);
         int load_b_gmem_k = bk * BK + load_b_smem_k;
         int load_b_gmem_addr = OFFSET(load_b_gmem_k, load_b_gmem_n, N);
@@ -56,6 +58,7 @@ __global__ void matmul_f32_v3(const float32_t* a, const float32_t* b, float32_t*
 
         __syncthreads();
 
+        // compute result of BM * BK and add to r_c
 #pragma unroll
         for (int k = 0; k < BK; k++) {
 #pragma unroll
@@ -72,6 +75,7 @@ __global__ void matmul_f32_v3(const float32_t* a, const float32_t* b, float32_t*
         __syncthreads();
     }
 
+    // write result to c
 #pragma unroll
     for (int i = 0; i < TM; i++) {
         int store_c_gmem_m = by * BM + ty * TM + i;
