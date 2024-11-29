@@ -1,42 +1,64 @@
-// @file: ./task-1/src/pjlab/bigchip/f16-v2.cu
-
 #include "playground/matmul.hpp"
 #include "playground/system.hpp"
+#include <cassert>
+#include <cstring>
 #include <cuda_runtime.h>
+#include <mma.h>
 
-namespace playground {
-    // Implement the matmul function with DType=float16_t and Version=2
+namespace playground
+{
+using namespace nvcuda;
 
-    __global__ void matmul(float16_t *A, float16_t *B, float16_t *C, int M, int N, int K) {
-        int row = blockIdx.y * blockDim.y + threadIdx.y;
-        int col = blockIdx.x * blockDim.x + threadIdx.x;
+constexpr int WARP_SIZE = 32;
+constexpr int M_TILE = 16;
+constexpr int N_TILE = 16;
+constexpr int K_TILE = 16;
 
-        if (row < M && col < N) {
-            float16_t value = 0.0;
-            for (int k = 0; k < K; ++k) {
-                value += A[row * K + k] * B[k * N + col];
-            }
-            C[row * N + col] = value;
-        }
-    }
-
-    PLAYGROUND_MATMUL_SIG(float16_t, 2, M, N, K, A, B, C) {
-        
-        float16_t *d_A, *d_B, *d_C;
-        cudaMalloc(&d_A, M * K * sizeof(float16_t));
-        cudaMalloc(&d_B, K * N * sizeof(float16_t));
-        cudaMalloc(&d_C, M * N * sizeof(float16_t));
-
-        cudaMemcpy(d_A, A, M * K * sizeof(float16_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_B, B, K * N * sizeof(float16_t), cudaMemcpyHostToDevice);
-
-        dim3 blockDim(32, 32);
-        dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);  // Calculate grid size
-
-        matmul<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
-
-        cudaMemcpy(C, d_C, M * N * sizeof(float16_t), cudaMemcpyDeviceToHost);
-    }
-
-    
+__host__ __device__ auto pad(int x, int y) -> int {
+    return ((x % y) != 0) ? ((x / y + 1) * y) : x;
 }
+
+__global__ void matmul_f16_v2(const float16_t* A, const float16_t* B, float16_t* C, int M, int N, int K) {
+    int N_PAD = pad(N, N_TILE);
+    int K_PAD = pad(K, K_TILE);
+    int idx, midx, nidx, ndim, kdim;
+
+    ndim = N_PAD / N_TILE;
+    kdim = K_PAD / K_TILE;
+    idx = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    nidx = idx % ndim;
+    midx = idx / ndim;
+
+    // initialize the fragment matrices
+    wmma::fragment<wmma::matrix_a, M_TILE, N_TILE, K_TILE, float16_t, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, M_TILE, N_TILE, K_TILE, float16_t, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, M_TILE, N_TILE, K_TILE, float16_t> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    float16_t* c_unique = C + nidx * N_TILE + midx * M_TILE * ndim * N_TILE;
+
+    for (int kidx = 0; kidx < kdim; kidx++) {
+        // Load the inputs
+        const float16_t* a_unique = A + kidx * K_TILE + midx * M_TILE * kdim * K_TILE;
+        const float16_t* b_unique = B + nidx * N_TILE + kidx * K_TILE * ndim * N_TILE;
+
+        wmma::load_matrix_sync(a_frag, a_unique, K_PAD);
+        wmma::load_matrix_sync(b_frag, b_unique, N_PAD);
+
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    wmma::store_matrix_sync(c_unique, c_frag, N_PAD, wmma::mem_row_major);
+}
+
+PLAYGROUND_MATMUL_SIG(float16_t, 2, M, N, K, A, B, C) {
+    constexpr int TILE = 16;
+    int M_PAD = pad(M, TILE);
+    int N_PAD = pad(N, TILE);
+    int nwarp = (M_PAD / TILE) * (N_PAD / TILE);
+    int GRID_DIM = (((nwarp * WARP_SIZE) % 512) != 0) ? nwarp * WARP_SIZE / 512 + 1 : nwarp * WARP_SIZE / 512;
+    playground::matmul_f16_v2<<<GRID_DIM, 512>>>(A, B, C, M, N, K);
+    cudaDeviceSynchronize();
+}
+}  // namespace playground

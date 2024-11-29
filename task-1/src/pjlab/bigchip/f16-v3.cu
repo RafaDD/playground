@@ -1,79 +1,131 @@
-// @file: ./task-1/src/pjlab/bigchip/f16-v2.cu
-
 #include "playground/matmul.hpp"
 #include "playground/system.hpp"
+#include <cassert>
+#include <cstring>
 #include <cuda_runtime.h>
+#include <mma.h>
 
-namespace playground
-{
-// Implement the matmul function with DType=float16_t and Version=2
+namespace playground {
 
-const int BLOCK = 32;
-const int STRIDE = 4;
+using namespace nvcuda;
 
-__global__ void matmul_v3(float16_t* a, float16_t* b, float16_t* c, int m, int n, int k)
-{
-    constexpr int STEP = BLOCK * STRIDE;
-    const int tx = threadIdx.x * STRIDE;
-    const int ty = threadIdx.y * STRIDE;
-    const int bx = blockIdx.x * STEP;
-    const int by = blockIdx.y * STEP;
+__device__ auto inline offset(int row, int col, int ld) -> int {
+    return row * ld + col;
+}
 
-    float16_t* begin_a = a + by * k;
-    float16_t* begin_b = b + bx;
-    float16_t* end_a = begin_a + k;
+__device__ auto FLOAT4(float16_t& pointer) -> float4& {
+    return reinterpret_cast<float4*>(&pointer)[0];
+}
 
-    float sum[STRIDE][STRIDE] = {0.f};
-    for (float16_t *a_ptr = begin_a, *b_ptr = begin_b; a_ptr < end_a;
-         a_ptr += STEP, b_ptr += STEP * n) {
-        __shared__ __align__(16 * 1024) float ashare[STEP][STEP];
-        __shared__ __align__(16 * 1024) float bshare[STEP][STEP];
+__device__ auto FLOAT4_CONST(const float16_t& pointer) -> const float4& {
+    return reinterpret_cast<const float4*>(&pointer)[0];
+}
 
-        for (int i = 0; i < STRIDE; ++i) {
-            for (int j = 0; j < STRIDE; ++j) {
-                ashare[ty + i][tx + j] = a_ptr[(ty + i) * k + tx + j];
-                bshare[ty + i][tx + j] = b_ptr[(ty + i) * n + tx + j];
-            }
-        }
-        __syncthreads();
+__global__ void matmul_f16_v3(const float16_t* A, const float16_t* B, float16_t* C,
+                          int M, int N, int K) {
 
-        for (int i = 0; i < STRIDE; ++i) {
-            for (int j = 0; j < STRIDE; ++j) {
-                for (int kk = 0; kk < STEP; ++kk) {
-                    sum[i][j] += ashare[ty + i][kk] * bshare[kk][tx + j];
-                }
-            }
-        }
+    const int BM = 128;
+    const int BN = 256;
+    const int BK = 32;
 
-        __syncthreads();
-    }
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+
+    const int APAD = 8;
+    const int BPAD = 8;
+
+    __shared__  __align__(16 * 1024) float16_t s_a[BM][BK + APAD];
+    __shared__  __align__(16 * 1024) float16_t s_b[BK][BN + BPAD];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, float16_t, wmma::row_major> frag_a[2][4];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, float16_t, wmma::row_major> frag_b[2][4];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float16_t> frag_c[4][4];
 
 #pragma unroll
-    for (int i = 0; i < STRIDE; ++i) {
-        for (int j = 0; j < STRIDE; ++j) {
-            c[(by + ty + i) * n + bx + tx + j] = sum[i][j];
+    for (auto &i : frag_c) {
+#pragma unroll
+        for (auto &j : i) {
+            wmma::fill_fragment(j, 0.0);
+        }
+    }
+
+    int load_a_smem_m = (tid >> 2) << 1;
+    int load_a_smem_k = (tid & 3) << 3;
+    int load_b_smem_k = (tid >> 5) << 2;
+    int load_b_smem_n = (tid & 31) << 3;
+
+    int load_a_gmem_m = by * BM + load_a_smem_m;
+
+    int load_a_gmem_addr = offset(load_a_gmem_m, load_a_smem_k, K);
+    int load_b_gmem_addr = offset(load_b_smem_k, load_b_smem_n, N);
+
+    int comp_c_frag_m = wid & 1;
+    int comp_c_frag_n = wid >> 1;
+
+#pragma unroll
+    for (int bk = 0; bk < K / BK; bk++) {
+        FLOAT4(s_a[load_a_smem_m][load_a_smem_k]) = FLOAT4_CONST(A[load_a_gmem_addr]);
+        FLOAT4(s_a[load_a_smem_m + 1][load_a_smem_k]) = FLOAT4_CONST(A[load_a_gmem_addr + K]);
+        FLOAT4(s_b[load_b_smem_k][load_b_smem_n]) = FLOAT4_CONST(B[load_b_gmem_addr]);
+        FLOAT4(s_b[load_b_smem_k + 1][load_b_smem_n]) = FLOAT4_CONST(B[load_b_gmem_addr + N]);
+        FLOAT4(s_b[load_b_smem_k + 2][load_b_smem_n]) = FLOAT4_CONST(B[load_b_gmem_addr + 2 * N]);
+        FLOAT4(s_b[load_b_smem_k + 3][load_b_smem_n]) = FLOAT4_CONST(B[load_b_gmem_addr + 3 * N]);
+
+        load_a_gmem_addr += BK;
+        load_b_gmem_addr += BK * N;
+
+        __syncthreads();
+
+        wmma::load_matrix_sync(frag_a[0][0], &s_a[comp_c_frag_m * 64][0], BK + APAD);
+        wmma::load_matrix_sync(frag_a[0][1], &s_a[comp_c_frag_m * 64 + 16][0], BK + APAD);
+        wmma::load_matrix_sync(frag_a[0][2], &s_a[comp_c_frag_m * 64 + 32][0],BK + APAD);
+        wmma::load_matrix_sync(frag_a[0][3], &s_a[comp_c_frag_m * 64 + 48][0], BK + APAD);
+        wmma::load_matrix_sync(frag_a[1][0], &s_a[comp_c_frag_m * 64][16], BK + APAD);
+        wmma::load_matrix_sync(frag_a[1][1], &s_a[comp_c_frag_m * 64 + 16][16], BK + APAD);
+        wmma::load_matrix_sync(frag_a[1][2], &s_a[comp_c_frag_m * 64 + 32][16], BK + APAD);
+        wmma::load_matrix_sync(frag_a[1][3], &s_a[comp_c_frag_m * 64 + 48][16], BK + APAD);
+
+        wmma::load_matrix_sync(frag_b[0][0], &s_b[0][comp_c_frag_n * 64], BN + BPAD);
+        wmma::load_matrix_sync(frag_b[0][1], &s_b[0][comp_c_frag_n * 64 + 16], BN + BPAD);
+        wmma::load_matrix_sync(frag_b[0][2], &s_b[0][comp_c_frag_n * 64 + 32], BN + BPAD);
+        wmma::load_matrix_sync(frag_b[0][3], &s_b[0][comp_c_frag_n * 64 + 48], BN + BPAD);
+        wmma::load_matrix_sync(frag_b[1][0], &s_b[16][comp_c_frag_n * 64], BN + BPAD);
+        wmma::load_matrix_sync(frag_b[1][1], &s_b[16][comp_c_frag_n * 64 + 16], BN + BPAD);
+        wmma::load_matrix_sync(frag_b[1][2], &s_b[16][comp_c_frag_n * 64 + 32], BN + BPAD);
+        wmma::load_matrix_sync(frag_b[1][3], &s_b[16][comp_c_frag_n * 64 + 48], BN + BPAD);
+
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                wmma::mma_sync(frag_c[i][j], frag_a[0][i], frag_b[0][j], frag_c[i][j]);
+                wmma::mma_sync(frag_c[i][j], frag_a[1][i], frag_b[1][j], frag_c[i][j]);
+            }
+        }
+        __syncthreads();
+    }
+
+    int store_c_gmem_m = by * BM + comp_c_frag_m * 64;
+    int store_c_gmem_n = bx * BN + comp_c_frag_n * 64;
+    int store_c_gmem_addr = offset(store_c_gmem_m, store_c_gmem_n, N);
+
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            wmma::store_matrix_sync(&C[store_c_gmem_addr + i * 16 * N + j * 16],
+                                    frag_c[i][j], N, wmma::mem_row_major);
         }
     }
 }
 
-PLAYGROUND_MATMUL_SIG(float16_t, 3, M, N, K, A, B, C)
-{
-
-    float16_t *d_A, *d_B, *d_C;
-    cudaMalloc(&d_A, M * K * sizeof(float16_t));
-    cudaMalloc(&d_B, K * N * sizeof(float16_t));
-    cudaMalloc(&d_C, M * N * sizeof(float16_t));
-
-    cudaMemcpy(d_A, A, M * K * sizeof(float16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, B, K * N * sizeof(float16_t), cudaMemcpyHostToDevice);
-
-    dim3 block(BLOCK, BLOCK);
-    dim3 grid((M + BLOCK - 1) / BLOCK / STRIDE, (N + BLOCK - 1) / BLOCK / STRIDE);
-
-    matmul_v3<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-
-    cudaMemcpy(C, d_C, M * N * sizeof(float16_t), cudaMemcpyDeviceToHost);
+PLAYGROUND_MATMUL_SIG(float16_t, 3, M, N, K, A, B, C) {
+    dim3 blocks((N + 256 - 1) / 256, (M + 128 - 1) / 128, 1);
+    dim3 threads(256, 1, 1);
+    playground::matmul_f16_v3<<<blocks, threads>>>(A, B, C, M, N, K);
+    cudaDeviceSynchronize();
 }
 
-}
-
+}  // namespace playground
